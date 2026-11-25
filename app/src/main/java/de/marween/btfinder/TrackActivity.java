@@ -48,6 +48,67 @@ public class TrackActivity extends Activity implements BtScanner.Listener {
     private TextView label, detail, trend, bestTv, audioState;
     private CheckBox soundBox, vibBox;
     private ToneGenerator tone;
+    static final int SIDE_BOTH = 0, SIDE_LEFT = 1, SIDE_RIGHT = 2;
+    private int side = SIDE_RIGHT;
+    private final Button[] sideButtons = new Button[3];
+    private AudioTrack beepTrack;
+    private int beepSide = -1;
+
+    private void paintSides() {
+        for (int i = 0; i < 3; i++) {
+            GradientDrawable g = new GradientDrawable();
+            g.setCornerRadius(dp(10));
+            g.setColor(i == side ? MainActivity.ACCENT : MainActivity.CARD);
+            sideButtons[i].setBackground(g);
+        }
+    }
+
+    /** Stereo-Puffer: der stumme Kanal bekommt 0 → nur ein Ohrhörer spielt. */
+    private static short[] stereo(short[] mono, int side) {
+        short[] out = new short[mono.length * 2];
+        for (int i = 0; i < mono.length; i++) {
+            out[2 * i] = side == SIDE_RIGHT ? 0 : mono[i];
+            out[2 * i + 1] = side == SIDE_LEFT ? 0 : mono[i];
+        }
+        return out;
+    }
+
+    private static AudioTrack makeTrack(short[] st) {
+        AudioTrack t = new AudioTrack.Builder()
+                .setAudioAttributes(new AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build())
+                .setAudioFormat(new AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(44100)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO).build())
+                .setBufferSizeInBytes(st.length * 2)
+                .setTransferMode(AudioTrack.MODE_STATIC)
+                .build();
+        t.write(st, 0, st.length);
+        return t;
+    }
+
+    /** Kurzer Annäherungs-Piep. Auf dem Kopfhörer nur auf der gewählten Seite. */
+    private void beep() {
+        boolean bt = btAudioConnected();
+        int s = bt ? side : SIDE_BOTH;
+        if (!bt && tone != null) { tone.startTone(ToneGenerator.TONE_PROP_BEEP, 80); return; }
+        try {
+            if (beepTrack == null || beepSide != s) {
+                if (beepTrack != null) beepTrack.release();
+                short[] m = new short[44100 * 90 / 1000];
+                for (int i = 0; i < m.length; i++)
+                    m[i] = (short) (Math.sin(2 * Math.PI * 2000 * i / 44100.0) * 26000);
+                beepTrack = makeTrack(stereo(m, s));
+                beepSide = s;
+            } else {
+                beepTrack.stop();
+                beepTrack.reloadStaticData();
+            }
+            beepTrack.play();
+        } catch (RuntimeException ignored) { beepTrack = null; }
+    }
     private Vibrator vibrator;
     private AudioTrack alarm;
 
@@ -114,6 +175,35 @@ public class TrackActivity extends Activity implements BtScanner.Listener {
         audioState = text(13, MainActivity.MUTED, false);
         root.addView(audioState);
 
+        TextView sideTitle = text(14, Color.WHITE, true);
+        sideTitle.setText("Welcher Hörer soll piepen?");
+        sideTitle.setPadding(0, dp(8), 0, dp(2));
+        root.addView(sideTitle);
+        LinearLayout sides = new LinearLayout(this);
+        sides.setGravity(Gravity.CENTER);
+        String[] names = {"Beide", "Nur links", "Nur rechts"};
+        side = getSharedPreferences("finder", MODE_PRIVATE).getInt("side", SIDE_RIGHT);
+        for (int i = 0; i < 3; i++) {
+            final int s = i;
+            Button sb = new Button(this);
+            sb.setText(names[i]);
+            sb.setAllCaps(false);
+            sb.setTextColor(Color.WHITE);
+            sideButtons[i] = sb;
+            sb.setOnClickListener(v -> {
+                side = s;
+                getSharedPreferences("finder", MODE_PRIVATE).edit().putInt("side", s).apply();
+                beepTrack = null;
+                if (alarm != null) { stopAlarm(); ringHeadphones(); }
+                paintSides();
+            });
+            LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(0, dp(44), 1f);
+            slp.setMargins(dp(3), 0, dp(3), 0);
+            sides.addView(sb, slp);
+        }
+        root.addView(sides);
+        paintSides();
+
         Button ring = new Button(this);
         ring.setText("🔊 Ton auf dem Kopfhörer abspielen");
         ring.setAllCaps(false);
@@ -167,6 +257,7 @@ public class TrackActivity extends Activity implements BtScanner.Listener {
     protected void onDestroy() {
         super.onDestroy();
         if (tone != null) tone.release();
+        if (beepTrack != null) beepTrack.release();
     }
 
     @Override
@@ -235,8 +326,7 @@ public class TrackActivity extends Activity implements BtScanner.Listener {
             if (live()) {
                 int pc = percent();
                 delay = 1500 - pc * 13L;           // 1,5 s (kalt) … 0,2 s (heiß)
-                if (soundBox.isChecked() && tone != null && alarm == null)
-                    tone.startTone(ToneGenerator.TONE_PROP_BEEP, 80);
+                if (soundBox.isChecked() && alarm == null) beep();
                 if (vibBox.isChecked() && vibrator != null && pc >= 45)
                     vibrator.vibrate(VibrationEffect.createOneShot(40, VibrationEffect.DEFAULT_AMPLITUDE));
             }
@@ -276,24 +366,18 @@ public class TrackActivity extends Activity implements BtScanner.Listener {
             double f = ((int) (t / 0.5)) % 2 == 0 ? 2200 : 2900;
             buf[i] = (short) (Math.sin(2 * Math.PI * f * t) * 30000);
         }
-        alarm = new AudioTrack.Builder()
-                .setAudioAttributes(new AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_MEDIA)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build())
-                .setAudioFormat(new AudioFormat.Builder()
-                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                        .setSampleRate(rate)
-                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build())
-                .setBufferSizeInBytes(buf.length * 2)
-                .setTransferMode(AudioTrack.MODE_STATIC)
-                .build();
-        alarm.write(buf, 0, buf.length);
+        alarm = makeTrack(stereo(buf, side));
         alarm.play();
-        ui.postDelayed(this::stopAlarm, secs * 1000L);
-        android.widget.Toast.makeText(this, "Ton läuft 15 s – nochmal tippen zum Stoppen", android.widget.Toast.LENGTH_SHORT).show();
+        ui.removeCallbacks(alarmStopper);
+        ui.postDelayed(alarmStopper, secs * 1000L);
+        String w = side == SIDE_RIGHT ? " (nur rechts)" : side == SIDE_LEFT ? " (nur links)" : "";
+        android.widget.Toast.makeText(this, "Ton läuft 15 s" + w + " – nochmal tippen zum Stoppen", android.widget.Toast.LENGTH_SHORT).show();
     }
 
+    private final Runnable alarmStopper = this::stopAlarm;
+
     private void stopAlarm() {
+        ui.removeCallbacks(alarmStopper);
         if (alarm == null) return;
         try { alarm.stop(); } catch (IllegalStateException ignored) { }
         alarm.release();
