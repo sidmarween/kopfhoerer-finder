@@ -326,11 +326,11 @@ public class MainActivity extends Activity implements BtScanner.Listener {
             boolean live = d.lastSeen > 0 && age < 15000;
             String icon = d.audio ? "🎧 " : "📶 ";
             t[0].setText(icon + (d.name != null && !d.name.isEmpty() ? d.name : "Unbekanntes Gerät"));
-            String info = (d.bonded ? "Gekoppelt · " : "") + d.address;
-            if (d.lastSeen == 0) info += " · noch nicht gefunden";
-            else if (!live) info += " · zuletzt vor " + (age / 1000) + " s";
-            else info += " · " + Math.round(d.smooth) + " dBm";
-            t[1].setText(info);
+            String inf = (d.bonded ? "Gekoppelt · " : "") + d.address;
+            if (d.lastSeen == 0) inf += " · noch nicht gefunden";
+            else if (!live) inf += " · zuletzt vor " + (age / 1000) + " s";
+            else inf += " · " + Math.round(d.smooth) + " dBm";
+            t[1].setText(inf);
             int level = live ? Signal.percent(d.smooth) : 0;
             int n = (level + 19) / 20;
             StringBuilder sb = new StringBuilder();
