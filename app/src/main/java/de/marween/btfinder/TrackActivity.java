@@ -36,7 +36,11 @@ import java.util.ArrayDeque;
 @SuppressLint("MissingPermission")
 public class TrackActivity extends Activity implements BtScanner.Listener {
 
-    private String address, name;
+    private String address, name, sig, ignore;
+    private boolean learned;
+    private int matched;
+    private final java.util.Map<String, double[]> sources = new java.util.HashMap<>();
+    private TextView diag;
     private BtScanner scanner;
     private final Handler ui = new Handler(Looper.getMainLooper());
     private double smooth = Double.NaN;
@@ -120,7 +124,11 @@ public class TrackActivity extends Activity implements BtScanner.Listener {
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         address = getIntent().getStringExtra("address");
         name = getIntent().getStringExtra("name");
-        scanner = new BtScanner(this, this);
+        sig = getIntent().getStringExtra("sig");
+        ignore = getIntent().getStringExtra("ignore");
+        learned = getIntent().getBooleanExtra("learned", false);
+        if (address == null) address = "";
+        scanner = BtScanner.get(this);
         vibrator = (Vibrator) getSystemService(VIBRATOR_SERVICE);
         try { tone = new ToneGenerator(AudioManager.STREAM_MUSIC, 90); } catch (RuntimeException ignored) { }
         buildUi();
@@ -139,7 +147,7 @@ public class TrackActivity extends Activity implements BtScanner.Listener {
         });
 
         TextView title = new TextView(this);
-        title.setText("🎧 " + (name != null && !name.isEmpty() ? name : address));
+        title.setText("🎧 " + (learned ? "Verlorener Hörer" : (name != null && !name.isEmpty() ? name : address)));
         title.setTextColor(Color.WHITE);
         title.setTextSize(22);
         title.setTypeface(Typeface.DEFAULT_BOLD);
@@ -157,6 +165,8 @@ public class TrackActivity extends Activity implements BtScanner.Listener {
         root.addView(trend);
         root.addView(detail);
         root.addView(bestTv);
+        diag = text(11, MainActivity.MUTED, false);
+        root.addView(diag);
 
         LinearLayout opts = new LinearLayout(this);
         opts.setGravity(Gravity.CENTER);
@@ -239,7 +249,9 @@ public class TrackActivity extends Activity implements BtScanner.Listener {
     @Override
     protected void onResume() {
         super.onResume();
-        scanner.start();
+        scanner.addListener(this);
+        scanner.setClassic(false);
+        scanner.acquire();
         ui.post(loop);
         ui.post(beeper);
     }
@@ -247,7 +259,8 @@ public class TrackActivity extends Activity implements BtScanner.Listener {
     @Override
     protected void onPause() {
         super.onPause();
-        scanner.stop();
+        scanner.removeListener(this);
+        scanner.release();
         ui.removeCallbacks(loop);
         ui.removeCallbacks(beeper);
         stopAlarm();
@@ -261,13 +274,23 @@ public class TrackActivity extends Activity implements BtScanner.Listener {
     }
 
     @Override
-    public void onSeen(String addr, String n, int rssi, boolean audio, boolean bonded) {
+    public void onSeen(String addr, String n, int rssi, boolean audio, boolean bonded, String s) {
+        if (ignore != null && addr.equalsIgnoreCase(ignore)) return;
         boolean match = addr.equalsIgnoreCase(address)
-                || (name != null && !name.isEmpty() && name.equals(n));
+                || (name != null && !name.isEmpty() && name.equals(n))
+                || (learned && sig != null && !sig.isEmpty() && sig.equals(s));
         if (!match) return;
         ui.post(() -> {
-            smooth = Double.isNaN(smooth) ? rssi : smooth * 0.7 + rssi * 0.3;
-            lastSeen = System.currentTimeMillis();
+            matched++;
+            long now = System.currentTimeMillis();
+            // Mehrere Adressen möglich (wechselnde Adresse) → jede einzeln glätten, stärkste zählt
+            double[] src = sources.get(addr);
+            if (src == null) sources.put(addr, src = new double[]{rssi, now});
+            else { src[0] = src[0] * 0.7 + rssi * 0.3; src[1] = now; }
+            double bestNow = -200;
+            for (double[] v : sources.values()) if (now - v[1] < 4000) bestNow = Math.max(bestNow, v[0]);
+            smooth = bestNow;
+            lastSeen = now;
             history.addLast(new double[]{lastSeen, smooth});
             while (!history.isEmpty() && lastSeen - history.peekFirst()[0] > 6000) history.removeFirst();
             best = Math.max(best, Signal.percent(smooth));
@@ -304,6 +327,8 @@ public class TrackActivity extends Activity implements BtScanner.Listener {
             radar.set(pc, true);
         }
         bestTv.setText(best > 0 ? "Bisher bestes Signal: " + best + " %" : "");
+        diag.setText(scanner.error != null ? "⚠ " + scanner.error
+                : "Empfangen: " + scanner.received + " Signale gesamt · " + matched + " vom Hörer");
         audioState.setText(btAudioConnected()
                 ? "✅ Ein Bluetooth-Kopfhörer ist gerade mit dem Handy verbunden"
                 : "Kopfhörer ist nicht als Audiogerät verbunden");

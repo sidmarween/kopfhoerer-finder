@@ -45,6 +45,7 @@ public class MainActivity extends Activity implements BtScanner.Listener {
         double smooth = -127;
         long lastSeen;
         boolean audio, bonded;
+        String sig = "";
     }
 
     private final Map<String, Dev> devices = new HashMap<>();
@@ -55,11 +56,15 @@ public class MainActivity extends Activity implements BtScanner.Listener {
     private Button scanBtn;
     private CheckBox onlyNamed;
     private DevAdapter listAdapter;
+    private boolean searching;
+    private boolean learning;
+    private final Map<String, double[]> learnSeen = new HashMap<>();
+    private final Map<String, String[]> learnInfo = new HashMap<>();
 
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
-        scanner = new BtScanner(this, this);
+        scanner = BtScanner.get(this);
         buildUi();
     }
 
@@ -102,6 +107,20 @@ public class MainActivity extends Activity implements BtScanner.Listener {
         scanBtn.setBackground(bg);
         scanBtn.setOnClickListener(v -> toggleScan());
         root.addView(scanBtn, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(56)));
+
+        Button learn = new Button(this);
+        learn.setText("🎯 Mit dem anderen Hörer anlernen");
+        learn.setTextColor(Color.WHITE);
+        learn.setTextSize(16);
+        learn.setAllCaps(false);
+        GradientDrawable lbg = new GradientDrawable();
+        lbg.setColor(0xFF7B2FF7);
+        lbg.setCornerRadius(dp(14));
+        learn.setBackground(lbg);
+        learn.setOnClickListener(v -> startLearning());
+        LinearLayout.LayoutParams llp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52));
+        llp.topMargin = dp(8);
+        root.addView(learn, llp);
 
         status = new TextView(this);
         status.setTextColor(MUTED);
@@ -159,19 +178,25 @@ public class MainActivity extends Activity implements BtScanner.Listener {
     // ---------- Suche ----------
 
     private void toggleScan() {
-        if (scanner.isRunning()) { stopScan(); return; }
+        if (searching) { stopScan(); return; }
         if (!ensureReady()) return;
         loadBonded();
-        if (scanner.start()) {
+        scanner.addListener(this);
+        if (scanner.acquire()) {
+            searching = true;
+            scanner.setClassic(true);
             scanBtn.setText("Suche stoppen");
+            ui.removeCallbacks(ticker);
             ui.post(ticker);
         } else {
-            status.setText("Bluetooth konnte nicht gestartet werden.");
+            scanner.release();
+            status.setText(scanner.error != null ? scanner.error : "Bluetooth konnte nicht gestartet werden.");
         }
     }
 
     private void stopScan() {
-        scanner.stop();
+        if (searching) { scanner.release(); searching = false; }
+        scanner.removeListener(this);
         scanBtn.setText("Suche starten");
         ui.removeCallbacks(ticker);
         refresh();
@@ -182,8 +207,16 @@ public class MainActivity extends Activity implements BtScanner.Listener {
     };
 
     @Override
-    public void onSeen(String address, String name, int rssi, boolean audio, boolean bonded) {
+    public void onSeen(String address, String name, int rssi, boolean audio, boolean bonded, String sig) {
         ui.post(() -> {
+            if (learning) {
+                double[] v = learnSeen.get(address);
+                if (v == null) learnSeen.put(address, new double[]{rssi, 1});
+                else { v[0] = Math.max(v[0], rssi); v[1]++; }
+                String[] info = learnInfo.get(address);
+                String nm = name != null && !name.isEmpty() ? name : (info != null ? info[0] : null);
+                learnInfo.put(address, new String[]{nm, sig});
+            }
             Dev d = devices.get(address);
             if (d == null) { d = new Dev(); d.address = address; devices.put(address, d); d.smooth = rssi; }
             if (name != null && !name.isEmpty()) d.name = name;
@@ -192,6 +225,7 @@ public class MainActivity extends Activity implements BtScanner.Listener {
             d.lastSeen = System.currentTimeMillis();
             d.audio |= audio;
             d.bonded |= bonded;
+            if (sig != null && !sig.isEmpty() && !"classic".equals(sig)) d.sig = sig;
         });
     }
 
@@ -212,9 +246,11 @@ public class MainActivity extends Activity implements BtScanner.Listener {
         });
         int live = 0;
         for (Dev d : devices.values()) if (d.lastSeen > 0 && now - d.lastSeen < 15000) live++;
-        status.setText(scanner.isRunning()
-                ? "Suche läuft … " + live + " Geräte in Reichweite"
-                : "Suche gestoppt");
+        String st = searching
+                ? "Suche läuft … " + live + " Geräte in Reichweite · " + scanner.received + " Signale empfangen"
+                : "Suche gestoppt";
+        if (scanner.error != null) st = "⚠ " + scanner.error;
+        status.setText(st);
         listAdapter.notifyDataSetChanged();
     }
 
@@ -222,8 +258,79 @@ public class MainActivity extends Activity implements BtScanner.Listener {
         Intent i = new Intent(this, TrackActivity.class);
         i.putExtra("address", d.address);
         i.putExtra("name", d.name);
+        i.putExtra("sig", d.sig);
         stopScan();
         startActivity(i);
+    }
+
+    // ---------- Anlernen ----------
+
+    private void startLearning() {
+        if (!ensureReady()) return;
+        new AlertDialog.Builder(this)
+                .setTitle("Anderen Hörer anlernen")
+                .setMessage("1. Nimm den Hörer, den du noch hast, aus dem Case.\n"
+                        + "2. Verbindet er sich mit dem Handy, trenne ihn in den Bluetooth-Einstellungen (Gerät antippen → Trennen). Verbundene Hörer senden oft kein Suchsignal.\n"
+                        + "3. Leg das Handy direkt neben den Hörer (wenige Zentimeter) und tippe auf „Jetzt anlernen“.\n\n"
+                        + "Die App merkt sich sein Funkmuster und sucht danach nach dem verlorenen Hörer, der genauso sendet.")
+                .setPositiveButton("Jetzt anlernen", (x, y) -> runLearning())
+                .setNegativeButton("Abbrechen", null).show();
+    }
+
+    private void runLearning() {
+        scanner.addListener(this);
+        if (!scanner.acquire()) {
+            scanner.release();
+            status.setText(scanner.error != null ? "⚠ " + scanner.error : "Bluetooth konnte nicht gestartet werden.");
+            return;
+        }
+        scanner.setClassic(false);
+        learnSeen.clear();
+        learning = true;
+        AlertDialog wait = new AlertDialog.Builder(this).setTitle("Lerne …")
+                .setMessage("Handy ruhig neben dem Hörer lassen (5 Sekunden).").setCancelable(false).show();
+        ui.postDelayed(() -> {
+            learning = false;
+            wait.dismiss();
+            scanner.release();
+            if (!searching) scanner.removeListener(this);
+            finishLearning();
+        }, 5000);
+    }
+
+    private void finishLearning() {
+        String best = null;
+        double bestRssi = -200;
+        for (Map.Entry<String, double[]> e : learnSeen.entrySet()) {
+            if (e.getValue()[0] > bestRssi) { bestRssi = e.getValue()[0]; best = e.getKey(); }
+        }
+        if (best == null || bestRssi < -70) {
+            new AlertDialog.Builder(this)
+                    .setTitle("Kein Hörer erkannt")
+                    .setMessage((learnSeen.isEmpty()
+                            ? "Es kam überhaupt kein Bluetooth-Signal an. Prüfe, ob Bluetooth an ist und die App die Berechtigung „Geräte in der Nähe“ hat (App-Info → Berechtigungen)."
+                            : "Es kamen " + learnSeen.size() + " Signale an, aber keins direkt neben dem Handy.")
+                            + "\n\nDein Hörer sendet vermutlich gerade nicht: Er ist noch mit dem Handy verbunden oder im Case. Trenne ihn in den Bluetooth-Einstellungen und versuch es noch mal.")
+                    .setPositiveButton("OK", null).show();
+            return;
+        }
+        String[] info = learnInfo.get(best);
+        final String addr = best, nm = info != null ? info[0] : null, sig = info != null ? info[1] : "";
+        new AlertDialog.Builder(this)
+                .setTitle("Hörer erkannt ✅")
+                .setMessage((nm != null ? nm : "Gerät ohne Namen") + "\nSignal: " + Math.round(bestRssi) + " dBm\n\n"
+                        + "Leg diesen Hörer jetzt zurück ins Case und schließ den Deckel. Danach sucht die App nach dem verlorenen Hörer mit dem gleichen Funkmuster.")
+                .setPositiveButton("Suche starten", (x, y) -> {
+                    Intent i = new Intent(this, TrackActivity.class);
+                    i.putExtra("address", "");
+                    i.putExtra("ignore", addr);
+                    i.putExtra("name", nm);
+                    i.putExtra("sig", sig);
+                    i.putExtra("learned", true);
+                    stopScan();
+                    startActivity(i);
+                })
+                .setNegativeButton("Abbrechen", null).show();
     }
 
     // ---------- Berechtigungen ----------
